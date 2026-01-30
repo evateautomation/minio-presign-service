@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -66,7 +65,7 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read raw body once (helps avoid n8n edge cases + allows debugging)
+	// Read raw body once (helps avoid edge cases + allows future debugging)
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "unable to read request body"})
@@ -98,7 +97,7 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 	alias := getenv("MINIO_ALIAS", "myminio")
 
 	// Build object path: folder + key (folder optional)
-	objectPath := joinObjectPath(req.Folder, req.Key) // e.g. "Jan 2026/file.pdf"
+	objectPath := joinObjectPath(req.Folder, req.Key)
 	target := fmt.Sprintf("%s/%s/%s", alias, req.Bucket, objectPath)
 
 	expire := buildExpire(req.Days, req.Hours, req.Minutes)
@@ -107,7 +106,7 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 		expire = "15m"
 	}
 
-	// Run: mc share download --expire 2d3h15m myminio/bucket/path/to/file
+	// Run: mc share download --expire 10m myminio/bucket/path/to/file
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
@@ -129,17 +128,18 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract ONLY the real presigned URL (must contain X-Amz-* params)
-	urlStr, err := extractPresignedURL(out)
+	// Extract the URL from the "Share:" line (this is the presigned URL).
+	urlStr, err := extractShareURL(out)
 	if err != nil {
 		// include mc output to make debugging easy
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
-			Error: "could not parse presigned url. mc output: " + strings.TrimSpace(out),
+			Error: "could not parse Share URL. mc output: " + strings.TrimSpace(out),
 		})
 		return
 	}
 
-	// Optionally rewrite returned URL to a public hostname users can access
+	// Optionally rewrite returned URL to a public hostname users can access.
+	// Use this if mc outputs an internal hostname.
 	// e.g. PUBLIC_MINIO_BASE_URL=https://minio2.evatefinance.com
 	urlStr = rewritePublicBase(urlStr)
 
@@ -242,22 +242,19 @@ func joinObjectPath(folder, key string) string {
 	return f + "/" + k
 }
 
-func extractPresignedURL(out string) (string, error) {
-	// Find all URLs in mc output
-	re := regexp.MustCompile(`https?://[^\s'"]+`)
-	all := re.FindAllString(out, -1)
-	if len(all) == 0 {
-		return "", errors.New("no URL found in mc output")
-	}
-
-	// Prefer URLs that look presigned (contain X-Amz-* params)
-	for _, u := range all {
-		if strings.Contains(u, "X-Amz-") || strings.Contains(u, "X-Amz-Signature") {
+// extractShareURL returns the presigned URL printed on the "Share:" line by `mc share download`.
+func extractShareURL(out string) (string, error) {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Share:") {
+			u := strings.TrimSpace(strings.TrimPrefix(line, "Share:"))
+			if u == "" {
+				return "", errors.New("Share line present but empty")
+			}
 			return u, nil
 		}
 	}
-
-	return "", errors.New("no presigned URL found in mc output (missing X-Amz-* params)")
+	return "", errors.New("could not find Share: line in mc output")
 }
 
 func rewritePublicBase(u string) string {
@@ -275,7 +272,7 @@ func rewritePublicBase(u string) string {
 		return u
 	}
 
-	// Keep the path + query, swap only scheme/host
+	// Keep the path + query, swap only scheme/host.
 	parsed.Scheme = pub.Scheme
 	parsed.Host = pub.Host
 	return parsed.String()
