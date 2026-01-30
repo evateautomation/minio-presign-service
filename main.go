@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -55,7 +57,7 @@ func main() {
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+	_, _ = w.Write([]byte("ok"))
 }
 
 func presignHandler(w http.ResponseWriter, r *http.Request) {
@@ -63,6 +65,16 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
 		return
 	}
+
+	// Read raw body once (helps avoid n8n edge cases + allows debugging)
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "unable to read request body"})
+		return
+	}
+	bodyStr := string(bodyBytes)
+	// Restore body for JSON decode
+	r.Body = io.NopCloser(strings.NewReader(bodyStr))
 
 	var req PresignRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -86,7 +98,7 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 	alias := getenv("MINIO_ALIAS", "myminio")
 
 	// Build object path: folder + key (folder optional)
-	objectPath := joinObjectPath(req.Folder, req.Key) // e.g. "invoices/Jan/file.pdf"
+	objectPath := joinObjectPath(req.Folder, req.Key) // e.g. "Jan 2026/file.pdf"
 	target := fmt.Sprintf("%s/%s/%s", alias, req.Bucket, objectPath)
 
 	expire := buildExpire(req.Days, req.Hours, req.Minutes)
@@ -96,36 +108,43 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Run: mc share download --expire 2d3h15m myminio/bucket/path/to/file
-	// NOTE: output format varies slightly by mc version, so we extract the first URL we see.
-	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "mc", "share", "download", "--expire", expire, target)
-	outBytes, err := cmd.CombinedOutput()
+	outBytes, cmdErr := cmd.CombinedOutput()
 	out := string(outBytes)
 
 	if ctx.Err() == context.DeadlineExceeded {
 		writeJSON(w, http.StatusGatewayTimeout, ErrorResponse{Error: "mc command timed out"})
 		return
 	}
-	if err != nil {
+	if cmdErr != nil {
 		// Return the mc error output (trimmed) to help debugging in n8n
 		msg := strings.TrimSpace(out)
 		if msg == "" {
-			msg = err.Error()
+			msg = cmdErr.Error()
 		}
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: msg})
 		return
 	}
 
-	url, err := extractFirstURL(out)
+	// Extract ONLY the real presigned URL (must contain X-Amz-* params)
+	urlStr, err := extractPresignedURL(out)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "could not extract URL from mc output"})
+		// include mc output to make debugging easy
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: "could not parse presigned url. mc output: " + strings.TrimSpace(out),
+		})
 		return
 	}
 
+	// Optionally rewrite returned URL to a public hostname users can access
+	// e.g. PUBLIC_MINIO_BASE_URL=https://minio2.evatefinance.com
+	urlStr = rewritePublicBase(urlStr)
+
 	writeJSON(w, http.StatusOK, PresignResponse{
-		URL:       url,
+		URL:       urlStr,
 		Object:    objectPath,
 		Bucket:    req.Bucket,
 		ExpiresIn: expire,
@@ -223,14 +242,43 @@ func joinObjectPath(folder, key string) string {
 	return f + "/" + k
 }
 
-func extractFirstURL(s string) (string, error) {
-	// Find first http/https URL (mc output usually contains exactly one)
+func extractPresignedURL(out string) (string, error) {
+	// Find all URLs in mc output
 	re := regexp.MustCompile(`https?://[^\s'"]+`)
-	m := re.FindString(s)
-	if m == "" {
-		return "", errors.New("no URL found")
+	all := re.FindAllString(out, -1)
+	if len(all) == 0 {
+		return "", errors.New("no URL found in mc output")
 	}
-	return m, nil
+
+	// Prefer URLs that look presigned (contain X-Amz-* params)
+	for _, u := range all {
+		if strings.Contains(u, "X-Amz-") || strings.Contains(u, "X-Amz-Signature") {
+			return u, nil
+		}
+	}
+
+	return "", errors.New("no presigned URL found in mc output (missing X-Amz-* params)")
+}
+
+func rewritePublicBase(u string) string {
+	publicBase := strings.TrimSpace(os.Getenv("PUBLIC_MINIO_BASE_URL"))
+	if publicBase == "" {
+		return u
+	}
+
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return u
+	}
+	pub, err := url.Parse(publicBase)
+	if err != nil {
+		return u
+	}
+
+	// Keep the path + query, swap only scheme/host
+	parsed.Scheme = pub.Scheme
+	parsed.Host = pub.Host
+	return parsed.String()
 }
 
 func getenv(k, def string) string {
